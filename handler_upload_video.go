@@ -7,6 +7,9 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -98,7 +101,7 @@ func (cfg *apiConfig) handlerUploadVideo(
 		)
 		return
 	}
-	defer os.Remove("tubely-upload.mp4")
+	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
 	if _, err = io.Copy(tempFile, file); err != nil {
@@ -113,12 +116,48 @@ func (cfg *apiConfig) handlerUploadVideo(
 
 	tempFile.Seek(0, io.SeekStart)
 
-	fileID := getAssetPath(mediaType)
+	processedFileName, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(
+			w,
+			http.StatusInternalServerError,
+			"couldn't convert file to faststart",
+			err,
+		)
+		return
+	}
+
+	processedFile, err := os.Open(processedFileName)
+	if err != nil {
+		respondWithError(
+			w,
+			http.StatusInternalServerError,
+			"couldn't open procesesed file",
+			err,
+		)
+		return
+	}
+
+	defer processedFile.Close()
+
+	aspectRatio, err := getVideoAspectRatio(processedFileName)
+	if err != nil {
+		respondWithError(
+			w,
+			http.StatusInternalServerError,
+			"couldn't get aspect ratio",
+			err,
+		)
+		return
+	}
+
+	fileID := cfg.prefixFileID(aspectRatio, mediaType)
+
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileID),
-		Body:        tempFile,
-		ContentType: &mediaType,
+		Body:        processedFile,
+		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
 		respondWithError(
@@ -130,8 +169,9 @@ func (cfg *apiConfig) handlerUploadVideo(
 		return
 	}
 
-	videoURL := cfg.getObjectURL(fileID)
-	dbVideo.VideoURL = &videoURL
+	url := fmt.Sprintf("https://%s/%s", cfg.s3CfDistribution, fileID)
+	fmt.Println(url)
+	dbVideo.VideoURL = &url
 	err = cfg.db.UpdateVideo(dbVideo)
 	if err != nil {
 		respondWithError(
@@ -142,5 +182,80 @@ func (cfg *apiConfig) handlerUploadVideo(
 		)
 		return
 	}
+	// dbVideo, err = cfg.dbVideoToSignedVideo(dbVideo)
+	// if err != nil {
+	// 	respondWithError(
+	// 		w,
+	// 		http.StatusInternalServerError,
+	// 		"Error signing video",
+	// 		err,
+	// 	)
+	// 	return
+	// }
 	respondWithJSON(w, http.StatusOK, dbVideo)
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(
+	video database.Video,
+) (database.Video, error) {
+	split := strings.Split(*video.VideoURL, ",")
+	if len(split) != 2 {
+		return database.Video{}, fmt.Errorf("url bad format")
+	}
+
+	fmt.Println(split)
+
+	presignedURL, err := generatePresignedURL(
+		cfg.s3Client,
+		split[0],
+		split[1],
+		2*time.Minute,
+	)
+
+	if err != nil {
+		return database.Video{}, err
+	}
+
+	video.VideoURL = &presignedURL
+
+	return video, nil
+}
+
+func generatePresignedURL(
+	s3Client *s3.Client,
+	bucket, key string,
+	expireTime time.Duration,
+) (string, error) {
+	presignedClient := s3.NewPresignClient(s3Client)
+	req, err := presignedClient.PresignGetObject(
+		context.Background(),
+		&s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		},
+		s3.WithPresignExpires(expireTime),
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Println(req.URL)
+	return req.URL, nil
+}
+
+func (cfg *apiConfig) prefixFileID(
+	aspectRatio string,
+	mediaType string,
+) string {
+	prefix := "other"
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape"
+	case "9:16":
+		prefix = "portrait"
+	}
+	fileID := getAssetPath(mediaType)
+	fileID = filepath.Join(prefix, fileID)
+	return fileID
 }

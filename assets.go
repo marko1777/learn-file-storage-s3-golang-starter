@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -50,4 +53,72 @@ func mediaTypeToExt(mediaType string) string {
 		return ".bin"
 	}
 	return "." + parts[1]
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath,
+	)
+
+	buf := bytes.NewBuffer(nil)
+	cmd.Stdout = buf
+
+	err := cmd.Run()
+
+	if err != nil {
+		fmt.Println(err)
+		return "", err
+	}
+
+	streams := struct {
+		Streams []struct {
+			DisplayAspectRatio string `json:"display_aspect_ratio"`
+		} `json:"streams"`
+	}{}
+	err = json.Unmarshal(buf.Bytes(), &streams)
+	if err != nil {
+		fmt.Println(err)
+		return "", err
+	}
+
+	for _, stream := range streams.Streams {
+		if stream.DisplayAspectRatio != "" {
+			return stream.DisplayAspectRatio, nil
+		}
+	}
+	return "", fmt.Errorf("couldn't get aspect ratio")
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	processedFilePath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		processedFilePath,
+	)
+	buf := bytes.NewBuffer(nil)
+
+	cmd.Stdout = buf
+
+	err := cmd.Run()
+
+	if err != nil {
+		fmt.Println(err)
+		return "", err
+	}
+
+	fileInfo, err := os.Stat(processedFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return processedFilePath, nil
 }
